@@ -1,0 +1,6 @@
+.DS_Store
+bin/
+# Private keys and other secrets: never in git.
+secrets/
+# Coverage profiles, from make cover.
+cover.out

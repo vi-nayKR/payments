@@ -1,0 +1,172 @@
+package transfer
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"math/rand/v2"
+	"sync"
+	"time"
+
+	"github.com/vi-nayKR/payments/internal/platform/telemetry"
+	"github.com/vi-nayKR/payments/internal/transfer/risk"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// The saga, as data: in each state, the step to run, where success leads,
+// and where a rejection leads. A release is retried until it works.
+var saga = map[State]struct {
+	name           string
+	run            func(Wallet, context.Context, Transfer) error
+	next, rejected State
+}{
+	Pending:      {"hold", Wallet.Hold, FundsHeld, Failed},
+	InReview:     {"review", timedOut, "", Compensating},
+	FundsHeld:    {"capture", Wallet.Capture, Completed, Compensating},
+	Compensating: {"release", Wallet.Release, Reversed, ""},
+}
+
+// An Orchestrator drives transfers through the saga, one step at a time.
+// Any number can run: claims and versions keep them out of each other's way.
+type Orchestrator struct {
+	store     *Store
+	wallet    Wallet
+	screener  Screener
+	logger    *slog.Logger
+	wake      chan struct{}
+	BatchSize int           // transfers per claim
+	Lease     time.Duration // how long a claim lasts: longer than any step
+	Poll      time.Duration
+	Backoff   time.Duration // the first retry's delay
+}
+
+// NewOrchestrator returns an Orchestrator with sensible defaults.
+func NewOrchestrator(store *Store, wallet Wallet, screener Screener, logger *slog.Logger) *Orchestrator {
+	return &Orchestrator{
+		store: store, wallet: wallet, screener: screener, logger: logger, wake: make(chan struct{}, 1),
+		BatchSize: 10, Lease: 10 * time.Second, Poll: time.Second, Backoff: time.Second,
+	}
+}
+
+// Wake tells Run there's a new transfer, without waiting for a poll.
+func (o *Orchestrator) Wake() {
+	select {
+	case o.wake <- struct{}{}:
+	default: // a wake-up is already waiting
+	}
+}
+
+// Run claims due transfers and runs their next step, until ctx is canceled.
+func (o *Orchestrator) Run(ctx context.Context) {
+	o.logger.Info("orchestrator started", "lease", o.Lease)
+	for ctx.Err() == nil {
+		n, err := o.RunOnce(ctx)
+		if err != nil && ctx.Err() == nil {
+			o.logger.Warn("claim transfers", "err", err)
+		}
+		if n > 0 {
+			continue // their next steps are due right away
+		}
+		select {
+		case <-ctx.Done():
+		case <-o.wake:
+		case <-time.After(o.Poll):
+		}
+	}
+}
+
+// RunOnce runs one step of each transfer in a claimed batch.
+func (o *Orchestrator) RunOnce(ctx context.Context) (int, error) {
+	batch, err := o.store.Claim(ctx, o.BatchSize, o.Lease)
+	if err != nil {
+		return 0, err
+	}
+	var wg sync.WaitGroup
+	for _, t := range batch {
+		// A step that has started finishes, even during shutdown.
+		wg.Go(func() { o.step(context.WithoutCancel(ctx), t) })
+	}
+	wg.Wait()
+	return len(batch), nil
+}
+
+// step runs t's next step, and moves t on, or schedules a retry.
+func (o *Orchestrator) step(ctx context.Context, t Transfer) {
+	s := saga[t.State]
+	// Each step is a span in the trace of the request that created t.
+	ctx, span := tracer.Start(telemetry.Extract(ctx, t.traceContext), "saga "+s.name,
+		trace.WithAttributes(attribute.String("transfer.id", t.ID.String())))
+	defer span.End()
+	log := o.logger.With("transfer", t.ID, "step", s.name)
+	next, err := o.screen(ctx, t, s.next)
+	if err == nil {
+		err = s.run(o.wallet, ctx, t)
+	}
+	var rejection *Rejection
+	switch {
+	case err == nil:
+		t, err = o.store.Advance(ctx, t, next, Step{s.name, "succeeded", ""})
+		if err == nil {
+			log.InfoContext(ctx, "step succeeded", "state", t.State)
+			finished(t)
+		}
+	case errors.As(err, &rejection) && s.rejected != "":
+		t.FailureReason = rejection.Reason
+		t, err = o.store.Advance(ctx, t, s.rejected, Step{s.name, "rejected", rejection.Reason})
+		if err == nil {
+			log.WarnContext(ctx, "step rejected", "reason", t.FailureReason, "state", t.State)
+			finished(t)
+		}
+	default:
+		// Maybe next time. A timeout doesn't mean it didn't happen: the
+		// retry is the same idempotent call.
+		delay := o.backoff(t.attempts)
+		log.WarnContext(ctx, "step failed, retrying", "attempt", t.attempts+1, "in", delay, "err", err)
+		span.SetStatus(codes.Error, err.Error())
+		stepRetries.WithLabelValues(s.name).Inc()
+		err = o.store.Retry(ctx, t, Step{s.name, "failed", err.Error()}, time.Now().Add(delay))
+	}
+	if errors.Is(err, ErrStale) {
+		log.InfoContext(ctx, "transfer moved on without us")
+	} else if err != nil {
+		log.ErrorContext(ctx, "record step", "err", err) // the lease runs out: it runs again
+	}
+}
+
+// backoff doubles with each attempt, up to a minute, with jitter.
+func (o *Orchestrator) backoff(attempts int32) time.Duration {
+	d := min(o.Backoff<<min(attempts, 16), time.Minute)
+	return (d/2 + rand.N(d/2+1)).Round(time.Millisecond)
+}
+
+// screen asks about a pending transfer before any money moves, and records
+// the answer. A deny is a rejection: the transfer fails. A review holds the
+// money all the same, and then waits, in review, instead of capturing it.
+func (o *Orchestrator) screen(ctx context.Context, t Transfer, next State) (State, error) {
+	if t.State != Pending {
+		return next, nil
+	}
+	a, err := o.screener.Screen(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	if err := o.store.Decide(ctx, t.ID, a); err != nil {
+		return "", err
+	}
+	riskDecisions.WithLabelValues(a.Decision.String()).Inc()
+	switch a.Decision {
+	case risk.Deny:
+		return "", &Rejection{Reason: "risk_declined"}
+	case risk.Review:
+		return InReview, nil
+	}
+	return next, nil
+}
+
+// timedOut is the review step: the orchestrator only claims a transfer in
+// review once its review has timed out, and then rejects it.
+func timedOut(Wallet, context.Context, Transfer) error {
+	return &Rejection{Reason: "review_timed_out"}
+}

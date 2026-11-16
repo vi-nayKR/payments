@@ -1,0 +1,75 @@
+package wallet
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+
+	"github.com/vi-nayKR/payments/internal/platform/apperr"
+	"github.com/vi-nayKR/payments/internal/wallet/walletdb"
+	"github.com/vi-nayKR/payments/internal/wallet/walletevents"
+	"github.com/google/uuid"
+)
+
+// ErrInsufficientFunds is returned when a transfer would take a wallet below
+// zero. Clients get a 422, with the code insufficient_funds.
+var ErrInsufficientFunds = apperr.NewRule("insufficient_funds", "insufficient funds")
+
+// Transfer moves amount from one account to another, as one balanced
+// transaction, and fails with ErrInsufficientFunds if from can't cover it.
+// The transfer.completed event commits with it.
+func (s *Store) Transfer(ctx context.Context, src, dst Account, amount int64) (Transaction, error) {
+	from, to, currency := src.ID, dst.ID, src.Currency
+	var posted Transaction
+	err := s.inTx(ctx, func(q *walletdb.Queries) error {
+		// Lock both accounts until we commit. Another transfer that touches
+		// either one waits right here, so the balance below stays true.
+		if err := lockInOrder(ctx, q, from, to); err != nil {
+			return err
+		}
+
+		b, err := q.GetAccountBalance(ctx, from)
+		if err != nil {
+			return fmt.Errorf("get balance %s: %w", from, err)
+		}
+		if b.Balance < amount {
+			return fmt.Errorf("wallet %s: %w", from, ErrInsufficientFunds)
+		}
+
+		posted, err = insertTransaction(ctx, q, NewTransaction{
+			Description: "transfer",
+			Postings: []Posting{
+				{AccountID: from, Direction: Debit, Amount: amount, Currency: currency},
+				{AccountID: to, Direction: Credit, Amount: amount, Currency: currency},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		return enqueue(ctx, q, walletevents.TransferCompleted, from, walletevents.Transfer{
+			TransactionID: posted.ID,
+			From:          eventWallet(src),
+			To:            eventWallet(dst),
+			Amount:        amount,
+		})
+	})
+	if err != nil {
+		return Transaction{}, fmt.Errorf("transfer: %w", err)
+	}
+	return posted, nil
+}
+
+// lockInOrder locks two accounts until we commit, the lower ID first. Every
+// caller takes them in the same order, so two transactions can never each
+// hold the lock the other one is waiting for: no deadlocks.
+func lockInOrder(ctx context.Context, q *walletdb.Queries, a, b uuid.UUID) error {
+	if bytes.Compare(a[:], b[:]) > 0 {
+		a, b = b, a
+	}
+	for _, id := range []uuid.UUID{a, b} {
+		if _, err := q.LockAccount(ctx, id); err != nil {
+			return fmt.Errorf("lock account %s: %w", id, err)
+		}
+	}
+	return nil
+}

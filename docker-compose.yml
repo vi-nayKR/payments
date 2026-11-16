@@ -1,0 +1,295 @@
+# Our five services, from their images, are in the app profile:
+#   docker compose --profile app up -d --build --wait
+# Plain docker compose up still starts only the infrastructure.
+x-service: &service
+  profiles: [app]
+  restart: unless-stopped
+  # Our binaries write nothing to disk, and need no Linux capabilities.
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+
+# A service's migrations: its own image, with -migrate, once, before it starts.
+x-migrate: &migrate
+  profiles: [app]
+  command: ["-migrate"]
+  depends_on:
+    postgres: {condition: service_healthy}
+
+# What every service gets: JSON logs, like production, and traces to Jaeger.
+# APP_ENV stays development, to keep every trace: production keeps one in ten.
+x-env: &env
+  APP_ENV: development
+  LOG_FORMAT: json
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: payments-postgres
+    # pg_stat_statements keeps statistics on every query: how often it ran,
+    # and how long it took. It has to be loaded when Postgres starts.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Over TCP: while its init scripts run, Postgres only listens on its
+      # socket, so a check through the socket says ready too early.
+      test: ["CMD-SHELL", "pg_isready -U payments -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    container_name: payments-redis
+    ports:
+      - "6379:6379"
+
+  nats:
+    image: nats:2.11-alpine
+    container_name: payments-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    # Busybox's wget is in the image: healthy once JetStream is up.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz?js-enabled-only=true"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Catches every email we send, in development. Its inbox: localhost:8025.
+  mailpit:
+    image: axllent/mailpit:v1.27
+    container_name: payments-mailpit
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  # Traces: OTLP comes in on 4317 (gRPC) and 4318 (HTTP), and the UI is on
+  # 16686. It keeps traces in memory, which is plenty for development.
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    container_name: payments-jaeger
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "16686:16686"
+
+  # Metrics: it scrapes every service's /metrics. Its UI is on 9090.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    container_name: payments-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    # Our services run on the host, outside Docker. Docker Desktop knows
+    # this name; on Linux, it needs this line.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Dashboards, on port 3000. Its data sources and dashboards come from
+  # files, so nothing is ever clicked together by hand.
+  grafana:
+    image: grafana/grafana:13.2.6
+    container_name: payments-grafana
+    environment:
+      # Development only: no login, and everyone is an admin.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+
+  wallet:
+    <<: *service
+    build: {context: ., args: {SERVICE: wallet, VERSION: "${VERSION:-dev}"}}
+    image: payments/wallet
+    environment: &wallet-env
+      <<: *env
+      WALLET_DATABASE_URL: postgres://wallet_app:wallet_app@postgres:5432/wallet?sslmode=disable
+      WALLET_REDIS_URL: redis://redis:6379/0
+      WALLET_NATS_URL: nats://nats:4222
+      WALLET_AUTH_PUBLIC_KEY_FILE: /run/secrets/auth_public_key
+      # Every fifteen seconds here, to watch it work. By default: daily, at 02:00 UTC.
+      WALLET_RECONCILE_EVERY: 15s
+      WALLET_TLS_DIR: /run/secrets/wallet_tls
+    secrets: [auth_public_key, wallet_tls]
+    ports: ["8081:8081", "9081:9081", "9091:9091"] # gRPC and internal: mTLS
+    depends_on:
+      wallet-migrate: {condition: service_completed_successfully}
+      nats: {condition: service_healthy}
+
+  wallet-migrate:
+    <<: *migrate
+    image: payments/wallet
+    environment:
+      <<: *wallet-env
+      # The owner: the only role that can change the schema.
+      WALLET_DATABASE_URL: postgres://wallet_owner:wallet_owner@postgres:5432/wallet?sslmode=disable
+
+  auth:
+    <<: *service
+    build: {context: ., args: {SERVICE: auth, VERSION: "${VERSION:-dev}"}}
+    image: payments/auth
+    environment: &auth-env
+      <<: *env
+      AUTH_DATABASE_URL: postgres://auth_app:auth_app@postgres:5432/auth?sslmode=disable
+      AUTH_PRIVATE_KEY_FILE: /run/secrets/auth_private_key
+      AUTH_TLS_DIR: /run/secrets/auth_tls
+    secrets: [auth_private_key, auth_tls]
+    ports: ["8082:8082"]
+    depends_on:
+      auth-migrate: {condition: service_completed_successfully}
+
+  auth-migrate:
+    <<: *migrate
+    image: payments/auth
+    environment:
+      <<: *auth-env
+      AUTH_DATABASE_URL: postgres://auth_owner:auth_owner@postgres:5432/auth?sslmode=disable
+
+  transfer:
+    <<: *service
+    build: {context: ., args: {SERVICE: transfer, VERSION: "${VERSION:-dev}"}}
+    image: payments/transfer
+    environment: &transfer-env
+      <<: *env
+      TRANSFER_DATABASE_URL: postgres://transfer_app:transfer_app@postgres:5432/transfer?sslmode=disable
+      TRANSFER_WALLET_ADDR: ${TRANSFER_WALLET_ADDR:-dns:///wallet:9081} # make chaos-up: through Toxiproxy
+      TRANSFER_NATS_URL: nats://nats:4222
+      TRANSFER_REDIS_URL: redis://redis:6379/0
+      TRANSFER_AUTH_PUBLIC_KEY_FILE: /run/secrets/auth_public_key
+      TRANSFER_TLS_DIR: /run/secrets/transfer_tls
+      TRANSFER_RISK_MAX_COUNT: ${TRANSFER_RISK_MAX_COUNT:-5} # load tests need more: make loadtest-up
+    secrets: [auth_public_key, transfer_tls]
+    ports: ["8083:8083", "9083:9083"]
+    depends_on:
+      transfer-migrate: {condition: service_completed_successfully}
+      nats: {condition: service_healthy}
+
+  transfer-migrate:
+    <<: *migrate
+    image: payments/transfer
+    environment:
+      <<: *transfer-env
+      TRANSFER_DATABASE_URL: postgres://transfer_owner:transfer_owner@postgres:5432/transfer?sslmode=disable
+
+  # It consumes the wallet's and the transfer service's streams, which they
+  # create when they start: so it starts after them.
+  notification:
+    <<: *service
+    build: {context: ., args: {SERVICE: notification, VERSION: "${VERSION:-dev}"}}
+    image: payments/notification
+    environment: &notification-env
+      <<: *env
+      NOTIFICATION_DATABASE_URL: postgres://notification_app:notification_app@postgres:5432/notification?sslmode=disable
+      NOTIFICATION_NATS_URL: nats://nats:4222
+      NOTIFICATION_AUTH_URL: https://auth:9082
+      NOTIFICATION_SMTP_ADDR: mailpit:1025
+      NOTIFICATION_TLS_DIR: /run/secrets/notification_tls
+    secrets: [notification_tls]
+    ports: ["8084:8084"]
+    depends_on:
+      notification-migrate: {condition: service_completed_successfully}
+      wallet: {condition: service_healthy}
+      transfer: {condition: service_healthy}
+
+  notification-migrate:
+    <<: *migrate
+    image: payments/notification
+    environment:
+      <<: *notification-env
+      NOTIFICATION_DATABASE_URL: postgres://notification_owner:notification_owner@postgres:5432/notification?sslmode=disable
+
+  # The only one that faces the internet. 9080 is its metrics and probes port.
+  gateway:
+    <<: *service
+    build: {context: ., args: {SERVICE: gateway, VERSION: "${VERSION:-dev}"}}
+    image: payments/gateway
+    environment:
+      <<: *env
+      GATEWAY_WALLET_ADDR: dns:///wallet:9081
+      GATEWAY_AUTH_URL: http://auth:8082
+      GATEWAY_TRANSFER_URL: ${GATEWAY_TRANSFER_URL:-http://transfer:8083} # make chaos-up: through Toxiproxy
+      GATEWAY_WEBHOOK_URL: http://webhook:8085
+      GATEWAY_WALLET_URL: http://wallet:8081
+      GATEWAY_REDIS_URL: redis://redis:6379/0
+      GATEWAY_AUTH_PUBLIC_KEY_FILE: /run/secrets/auth_public_key
+      GATEWAY_IP_LIMIT: ${GATEWAY_IP_LIMIT:-20}
+      GATEWAY_TLS_DIR: /run/secrets/gateway_tls
+    secrets: [auth_public_key, gateway_tls]
+    ports: ["8080:8080", "9080:9080", "9088:9088"] # 9088: internal, mTLS
+
+  # Webhooks. It consumes the transfer service's stream, so it starts after it.
+  webhook:
+    <<: *service
+    build: {context: ., args: {SERVICE: webhook, VERSION: "${VERSION:-dev}"}}
+    image: payments/webhook
+    environment: &webhook-env
+      <<: *env
+      WEBHOOK_DATABASE_URL: postgres://webhook_app:webhook_app@postgres:5432/webhook?sslmode=disable
+      WEBHOOK_NATS_URL: nats://nats:4222
+      WEBHOOK_AUTH_PUBLIC_KEY_FILE: /run/secrets/auth_public_key
+      WEBHOOK_RETRY_SCHEDULE: ${WEBHOOK_RETRY_SCHEDULE:-} # empty: the real one
+    secrets: [auth_public_key]
+    ports: ["8085:8085"]
+    # For receivers on this machine, outside Docker: Linux needs this line.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    depends_on:
+      webhook-migrate: {condition: service_completed_successfully}
+      transfer: {condition: service_healthy}
+
+  webhook-migrate:
+    <<: *migrate
+    image: payments/webhook
+    environment:
+      <<: *webhook-env
+      WEBHOOK_DATABASE_URL: postgres://webhook_owner:webhook_owner@postgres:5432/webhook?sslmode=disable
+
+  # Network faults, on demand, for chaos experiments: a TCP proxy that we can
+  # slow down or cut, through its API on port 8474. make chaos-up puts it in
+  # front of the transfer service, and of the wallet's gRPC port.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: [chaos]
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy.json"]
+    volumes:
+      - ./deploy/chaos/toxiproxy.json:/etc/toxiproxy.json:ro
+    ports:
+      - "8474:8474"
+
+volumes:
+  pgdata:
+
+# Mounted as files under /run/secrets, never copied into an image. make keys
+# and make certs create them.
+secrets:
+  auth_private_key:
+    file: secrets/auth_ed25519.pem
+  auth_public_key:
+    file: secrets/auth_ed25519.pub.pem
+  # A directory each, from make certs.
+  wallet_tls:
+    file: secrets/tls/wallet
+  auth_tls:
+    file: secrets/tls/auth
+  transfer_tls:
+    file: secrets/tls/transfer
+  notification_tls:
+    file: secrets/tls/notification
+  gateway_tls:
+    file: secrets/tls/gateway
